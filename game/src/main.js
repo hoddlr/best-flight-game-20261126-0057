@@ -1,304 +1,350 @@
-// Sky Courier: boot and the one loop. Input is read every frame, the world
-// advances in fixed 1/60 s steps, and the renderer paints what is there.
-// Screens: title, fly, paused, over, done. Missions run in order: fly the
-// rings to the next strip, land soft, pick up the next parcel, repeat until
-// all three parcels are delivered at High Pass.
-//
-// ?seed=N fixes the valley. ?shot=start|fly|land|end stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady.
+// main.js — Sky Courier: SORTIE 01. A 3D low-poly prop-plane delivery game
+// in raw WebGL: no library, no CDN, no network. The plane flies a golden
+// valley at sunset, threads six numbered neon gates and delivers three
+// parcels, one leg at a time, to the airstrips Home Field, Riverbend,
+// Mill Town and High Pass. Physics runs on a fixed 60 Hz step; the world
+// is seeded, so every run grows the same valley.
 
-import { BEST_KEY, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, groundHeightAt, resetRings, stripAt } from './world.js';
-import { createPlane, placeOnRunway, speedOf, stepPlane } from './plane.js';
-import { ACTION_CONFIRM, ACTION_MUTE, ACTION_PAUSE, createInput, takeActions, takeClick } from './input.js';
-import { cameraFor, createRenderer, SCREEN_DONE, SCREEN_FLY, SCREEN_OVER, SCREEN_PAUSED, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
-
-const MAX_FRAME = 0.25;
-const STRIP_NAMES = ['Home Field', 'Riverbend', 'Mill Town', 'High Pass'];
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : 7;
+import { matPerspective, matLookAt, matFromPose, matTranslate, matScale, matMultiply, matRotateY } from './mat.js';
+import { makeProgram, uploadMesh, drawMesh } from './glx.js';
+import { buildWorld, buildGates, heightAt, FIELDS, gateMeshArrays } from './world.js';
+import { buildPlaneMesh, buildFlameMesh, freshPlane, stepPlane, runwayAt } from './plane.js';
+import { makeInput } from './input.js';
+import { makeAudio } from './audio.js';
+import { drawHud } from './hud.js';
+import { clamp } from './seed.js';
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
-const plane = createPlane();
-placeOnRunway(plane, world);
+const statusEl = document.getElementById('status');
+const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
+if (!gl) {
+  document.body.textContent = 'Sky Courier needs WebGL, which this browser did not offer.';
+  throw new Error('no webgl');
+}
+const hudCanvas = document.createElement('canvas');
+hudCanvas.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;pointer-events:none;';
+document.body.appendChild(hudCanvas);
+const hud = hudCanvas.getContext('2d');
 
-let screen = SCREEN_TITLE;
-let score = 0;
-let lastLandingScoreAt = -99;
-let best = readBest();
-let leg = 0; // which strip the next parcel goes to (1, 2, 3)
-let mission = 'Take off from Home Field';
-let message = '';
-let messageUntil = 0;
-let particles = [];
-let muted = false;
-let audio = null;
-let time = 0;
+const prog = makeProgram(gl);
+gl.useProgram(prog.prog);
+gl.enable(gl.DEPTH_TEST);
+gl.clearColor(0.98, 0.62, 0.28, 1);
+const SUN_DIR = [-0.82, 0.34, -0.2];
+const FOG_COLOR = [0.94, 0.6, 0.34];
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+const world = buildWorld(gl, (arrays) => uploadMesh(gl, arrays));
+const planeMesh = uploadMesh(gl, buildPlaneMesh());
+const flameMesh = uploadMesh(gl, buildFlameMesh());
+const gateMeshes = new Map(); // gate number -> {next, later, done} meshes
+for (const g of world.gates) {
+  gateMeshes.set(g.n, {
+    next: uploadMesh(gl, gateMeshArrays(g, [0.25, 0.9, 1])),
+    later: uploadMesh(gl, gateMeshArrays(g, [1, 0.62, 0.18])),
+    done: uploadMesh(gl, gateMeshArrays(g, [0.35, 0.85, 0.5])),
+  });
+}
+const identity = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+const input = makeInput();
+const audio = makeAudio();
+
+function freshGame() {
+  return {
+    state: 'menu',
+    plane: freshPlane(),
+    gates: buildGates(),
+    leg: 0, // 0: Home->Riverbend, 1: ->Mill Town, 2: ->High Pass
+    score: 0,
+    delivered: 0,
+    rings: 0,
+    softLandings: 0,
+    msg: '', sub: '', msgAge: 99, msgColor: '#ffb347',
+    crashWhy: '',
+    muted: false,
+    time: 0,
+    camPos: null,
+    stallBeepAt: -9,
+    finalField: 'HIGH PASS',
+    finalX: FIELDS[3].x,
+    finalZ: FIELDS[3].z,
+  };
+}
+let S = freshGame();
+
+function announce(msg, sub, color) {
+  S.msg = msg;
+  S.sub = sub || '';
+  S.msgAge = 0;
+  S.msgColor = color || '#ffb347';
+  if (statusEl) statusEl.textContent = msg + (sub ? ' ' + sub : '');
+}
+
+// ---- mission --------------------------------------------------------------
+
+function nextGate() {
+  // Gates belong to legs, two each: the next unpassed gate of this leg.
+  // When the leg's pair is done the answer is null — time to land.
+  const first = S.leg * 2 + 1;
+  for (const g of S.gates) {
+    if (g.n >= first && g.n <= first + 1 && !g.passed) return g;
+  }
+  return null;
+}
+
+function legDestField() {
+  return FIELDS[S.leg + 1];
+}
+
+function handleEvents(events) {
+  const p = S.plane;
+  for (const e of events) {
+    if (e.type === 'stall') {
+      if (S.time - S.stallBeepAt > 0.9) {
+        S.stallBeepAt = S.time;
+        audio.stallWarn();
+        announce('STALL — NOSE DOWN, ADD POWER', '', '#e5484d');
+      }
+    } else if (e.type === 'fuelEmpty') {
+      announce('FUEL EMPTY — GLIDE HER IN', '', '#e5484d');
+    } else if (e.type === 'takeoff') {
+      announce('AIRBORNE', 'Gear up — fly the gates', '#39d5e8');
+      audio.land();
+    } else if (e.type === 'landed') {
+      const g = nextGate();
+      const dest = legDestField();
+      if (e.field === dest && !g) {
+        // Parcel delivered: refuel, next leg, or the sortie is done.
+        S.delivered++;
+        S.score += 300;
+        if (e.soft) {
+          S.score += 120;
+          S.softLandings++;
+        }
+        p.fuel = 100;
+        audio.deliver();
+        if (S.leg >= 2) {
+          S.state = 'done';
+          announce('SORTIE COMPLETE', '', '#ffb347');
+        } else {
+          S.leg++;
+          const next = legDestField();
+          announce(`PARCEL DELIVERED +300`, e.soft ? `Soft landing +120 · refuelled — next: ${next.name}` : `Refuelled — next: ${next.name}`, '#58d68d');
+        }
+      } else if (e.field === dest) {
+        announce('WRONG TIME TO LAND', 'Fly the remaining gates first', '#e5484d');
+        p.hull = Math.max(0, p.hull - 5);
+      } else {
+        // A stop at a strip that is not this leg's destination.
+        if (e.soft) {
+          S.score += 120;
+          S.softLandings++;
+          announce('SOFT LANDING +120', 'Not your delivery strip — take off again');
+        } else {
+          announce('LANDED', 'Not your delivery strip — take off again');
+        }
+        audio.land();
+      }
+    } else if (e.type === 'roughLanding') {
+      audio.thud();
+      announce('ROUGH FIELD LANDING — HULL -16', '', '#e5484d');
+    } else if (e.type === 'crash') {
+      p.crashed = true;
+      S.state = 'crash';
+      audio.thud();
+      S.crashWhy = e.vspeed < -14
+        ? `Came down at ${Math.round(-e.vspeed * 196.85)} FPM into the ground.`
+        : p.fuel <= 0
+          ? 'Out of fuel over the valley — she glided as far as she could.'
+          : 'The airframe gave out.';
+    }
   }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off: the best score then lasts this visit only.
+function checkGatePass() {
+  const g = nextGate();
+  if (!g || S.plane.onGround) return;
+  const d = Math.hypot(g.x - S.plane.x, g.y - S.plane.y, g.z - S.plane.z);
+  if (d < g.radius + 3) {
+    g.passed = true;
+    S.rings++;
+    S.score += 50;
+    audio.gate();
+    const more = nextGate();
+    announce(`GATE ${g.n} CLEAR +50`, more ? `Next: gate ${more.n} → ${more.dest}` : `All gates clear — land at ${legDestField().name}`, '#39d5e8');
   }
 }
 
-function showMessage(text, seconds) {
-  message = text;
-  messageUntil = time + seconds;
+// ---- view -----------------------------------------------------------------
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  canvas.width = w;
+  canvas.height = h;
+  hudCanvas.width = w;
+  hudCanvas.height = h;
+  gl.viewport(0, 0, w, h);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function cameraFor(p, dt) {
+  // Chase camera: behind and above the tail, eased toward its target so it
+  // never snaps, and always looking a little ahead of the nose.
+  const back = 13 + p.speed * 0.08;
+  const up = 4.5 + p.speed * 0.02;
+  const cy = Math.cos(p.heading), sy = Math.sin(p.heading);
+  const tx = p.x - cy * back;
+  const ty = p.y + up + Math.sin(p.pitch) * 3;
+  const tz = p.z + sy * back;
+  if (!S.camPos) S.camPos = [tx, ty, tz];
+  const k = Math.min(1, dt * 4.5);
+  S.camPos[0] += (tx - S.camPos[0]) * k;
+  S.camPos[1] += (ty - S.camPos[1]) * k;
+  S.camPos[2] += (tz - S.camPos[2]) * k;
+  const look = [
+    p.x + Math.cos(p.heading) * 26,
+    p.y + Math.sin(p.pitch) * 10,
+    p.z - Math.sin(p.heading) * 26,
+  ];
+  return { eye: S.camPos, look };
 }
 
-function missionText() {
-  if (leg >= 3) return 'All parcels delivered!';
-  return `Deliver parcel ${leg + 1} of 3 → ${STRIP_NAMES[leg + 1]}`;
-}
+// ---- render + loop ----------------------------------------------------------
 
-/** A soft landing on the strip the parcel is bound for. */
-function deliverIfDue() {
-  if (leg >= 3) return false;
-  const strip = plane.landedStrip;
-  if (!strip || strip.name !== STRIP_NAMES[leg + 1]) return false;
-  leg += 1;
-  score += 300;
-  plane.fuel = Math.min(100, plane.fuel + 34);
-  plane.damage = Math.max(0, plane.damage - 15);
-  showMessage(`Parcel ${leg} of 3 delivered! +300  •  fuel topped up`, 3.5);
-  burst(plane.x, plane.y - 30, '#ffd94a', 26);
-  if (leg >= 3) {
-    screen = SCREEN_DONE;
-    finishRun();
+function render(now) {
+  const w = canvas.width, h = canvas.height;
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  const proj = matPerspective((62 * Math.PI) / 180, w / h, 0.5, 9000);
+  gl.uniformMatrix4fv(prog.uProj, false, proj);
+  gl.uniform3fv(prog.uSunDir, SUN_DIR);
+  gl.uniform3fv(prog.uFogColor, FOG_COLOR);
+  const p = S.plane;
+  let view;
+  if (S.state === 'fly' || S.state === 'pause') {
+    const cam = cameraFor(p, 1 / 60);
+    view = matLookAt(cam.eye, cam.look, [0, 1, 0]);
   } else {
-    mission = missionText();
+    // Menu, crash and done: a slow orbit around the plane on its strip,
+    // pulled back far enough to show the valley behind it.
+    const a = now * 0.00012;
+    const eye = [p.x + Math.cos(a) * 46, p.y + 18, p.z + Math.sin(a) * 46];
+    view = matLookAt(eye, [p.x, p.y + 1, p.z], [0, 1, 0]);
+    S.camPos = null;
   }
-  return true;
+  gl.uniformMatrix4fv(prog.uView, false, view);
+  // Sky and sun sit far away: fog must not swallow them.
+  gl.uniform2fv(prog.uFogRange, [6500, 8800]);
+  drawMesh(gl, prog, world.sky, identity, true);
+  drawMesh(gl, prog, world.sun, identity, true);
+  gl.uniform2fv(prog.uFogRange, [260, 2400]);
+  drawMesh(gl, prog, world.terrain, identity, false);
+  drawMesh(gl, prog, world.strips, identity, false);
+  drawMesh(gl, prog, world.forest, identity, false);
+  // Gates: the next one burns cyan, later ones amber, passed ones green.
+  const next = nextGate();
+  for (const g of S.gates) {
+    const set = gateMeshes.get(g.n);
+    const mesh = g.passed ? set.done : g === next ? set.next : set.later;
+    drawMesh(gl, prog, mesh, identity, true);
+  }
+  // The plane.
+  const pose = matFromPose(p.x, p.y, p.z, p.heading, p.pitch, p.bank);
+  drawMesh(gl, prog, planeMesh, pose, false);
+  // Afterburner glow at high throttle.
+  if (p.throttle > 0.85 && !p.onGround) {
+    const flick = 1 + 0.22 * Math.sin(now * 0.045) + 0.1 * Math.sin(now * 0.11);
+    const flameModel = matMultiply(pose, matScale(flick, 1, 1));
+    drawMesh(gl, prog, flameMesh, flameModel, true);
+  }
+  // HUD.
+  hud.clearRect(0, 0, w, h);
+  S.nextGate = next;
+  // The objective line's destination is this leg's strip, not always the
+  // final one: after a leg's gates are done the HUD must name the strip
+  // the parcel is actually going to.
+  const destField = legDestField();
+  S.finalField = destField.name;
+  S.finalX = destField.x;
+  S.finalZ = destField.z;
+  drawHud(hud, w, h, S);
 }
 
-function finishRun() {
-  if (score > best) {
-    best = score;
-    saveBest(best);
-  }
-}
+let last = performance.now();
+let acc = 0;
+const STEP = 1 / 60;
 
-function burst(x, y, colour, count) {
-  for (let i = 0; i < count; i += 1) {
-    const a = Math.random() * Math.PI * 2;
-    const sp = 40 + Math.random() * 160;
-    particles.push({
-      x, y,
-      vx: Math.cos(a) * sp,
-      vy: Math.sin(a) * sp - 40,
-      life: 0.7 + Math.random() * 0.5,
-      maxLife: 1.2,
-      colour,
-    });
-  }
-}
-
-/** Procedural engine hum: two detuned oscillators through a low-pass
- * filter, pitch following throttle. No audio files, no network. */
-function ensureAudio() {
-  if (muted || audio) return;
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    osc.type = 'sawtooth';
-    osc.frequency.value = 70;
-    const osc2 = ctx.createOscillator();
-    osc2.type = 'square';
-    osc2.frequency.value = 35;
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = 320;
-    const gain = ctx.createGain();
-    gain.gain.value = 0.0;
-    osc.connect(filter);
-    osc2.connect(filter);
-    filter.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start();
-    osc2.start();
-    audio = { ctx, osc, osc2, gain };
-  } catch {
-    audio = null;
-  }
-}
-
-function updateAudio() {
-  if (!audio) return;
-  const target = screen === SCREEN_FLY && plane.airborne ? 0.05 + plane.throttle * 0.05 : 0.0;
-  audio.gain.gain.setTargetAtTime(target, audio.ctx.currentTime, 0.1);
-  audio.osc.frequency.setTargetAtTime(60 + plane.throttle * 90, audio.ctx.currentTime, 0.1);
-  audio.osc2.frequency.setTargetAtTime(30 + plane.throttle * 45, audio.ctx.currentTime, 0.1);
-}
-
-function resetRun() {
-  placeOnRunway(plane, world);
-  resetRings(world);
-  score = 0;
-  lastLandingScoreAt = -99;
-  leg = 0;
-  particles = [];
-  mission = missionText();
-  showMessage('Parcel 1 of 3 → Riverbend. Follow the gold rings!', 4);
-}
-
-function stepGame(input, dt) {
-  time += dt;
-  const actions = takeActions(input);
-  if (actions & ACTION_MUTE) {
-    muted = !muted;
-    if (muted && audio) audio.gain.gain.value = 0;
-    showMessage(muted ? 'Sound off (M to turn back on)' : 'Sound on', 2);
-  }
-  if (screen === SCREEN_TITLE) {
-    if (actions & ACTION_CONFIRM) {
-      ensureAudio();
-      resetRun();
-      screen = SCREEN_FLY;
-    }
-    return;
-  }
-  if (screen === SCREEN_PAUSED) {
-    if (actions & ACTION_PAUSE || actions & ACTION_CONFIRM) screen = SCREEN_FLY;
-    return;
-  }
-  if (screen === SCREEN_OVER || screen === SCREEN_DONE) {
-    if (actions & ACTION_CONFIRM) {
-      resetRun();
-      screen = SCREEN_FLY;
-    }
-    return;
-  }
-  // Flying.
-  if (actions & ACTION_PAUSE) {
-    screen = SCREEN_PAUSED;
-    return;
-  }
-  const stick = (input.pitchUp ? -1 : 0) + (input.pitchDown ? 1 : 0);
-  const event = stepPlane(plane, world, stick, input.throttleUp, input.throttleDown, dt);
-  // Rings: flying through one scores and puffs gold.
-  for (const ring of world.rings) {
-    if (ring.taken || ring.leg !== leg) continue;
-    const dx = plane.x - ring.x;
-    const dy = plane.y - ring.y;
-    if (dx * dx + dy * dy < 46 * 46) {
-      ring.taken = true;
-      score += 50;
-      burst(ring.x, ring.y, '#ffd94a', 14);
-      showMessage('Ring! +50', 1.2);
-    }
-  }
-  // Dust while rolling, smoke while damaged.
-  if (!plane.airborne && speedOf(plane) > 40 && Math.random() < 0.4) {
-    particles.push({ x: plane.x - 30, y: plane.y + 10, vx: -30, vy: -20, life: 0.5, maxLife: 0.5, colour: '#c8b898' });
-  }
-  if (plane.damage > 50 && Math.random() < 0.3) {
-    particles.push({ x: plane.x - 20, y: plane.y - 6, vx: -20, vy: -50, life: 0.8, maxLife: 0.8, colour: '#888888' });
-  }
-  for (const p of particles) {
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    p.vy += 60 * dt;
-    p.life -= dt;
-  }
-  particles = particles.filter((p) => p.life > 0);
-  if (message && time > messageUntil) message = '';
-  updateAudio();
-  if (!event) return;
-  if (event === 'takeoff') {
-    showMessage('Airborne! Mind your speed — too slow and you stall.', 3);
-  } else if (event === 'landed-soft') {
-    // One soft-landing bonus per real arrival: bouncing along the strip
-    // must not farm points.
-    if (time - lastLandingScoreAt > 10) {
-      score += 120;
-      lastLandingScoreAt = time;
-      showMessage('Soft landing! +120', 2.5);
-    }
-    burst(plane.x, plane.y - 10, '#37d67a', 16);
-    deliverIfDue();
-  } else if (event === 'landed-hard') {
-    showMessage(`Hard landing — airframe damage ${Math.round(plane.damage)}%`, 2.5);
-    burst(plane.x, plane.y - 10, '#ff6a5a', 16);
-    deliverIfDue();
-  } else if (event === 'out-of-fuel') {
-    showMessage('Fuel empty! Glide down and land to refuel.', 3);
-  } else if (event === 'crashed') {
-    burst(plane.x, plane.y - 10, '#ff6a5a', 40);
-    burst(plane.x, plane.y - 10, '#555555', 24);
-    screen = SCREEN_OVER;
-    finishRun();
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world, plane);
-  let painted = 0;
-  function paint() {
-    renderer.draw({
-      world,
-      plane: scene.plane,
-      cameraX: scene.cameraX,
-      screen: scene.screen,
-      score: scene.score,
-      mission: scene.mission,
-      message: scene.message,
-      time: scene.time,
-      particles: scene.particles,
-    });
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let accumulator = 0;
-  let last = performance.now();
-  function frame(now) {
-    const elapsed = Math.min(MAX_FRAME, (now - last) / 1000);
-    last = now;
-    accumulator += elapsed;
-    while (accumulator >= STEP) {
-      stepGame(input, STEP);
-      accumulator -= STEP;
-    }
-    const view = {
-      world,
-      plane,
-      cameraX: cameraFor(plane.x),
-      screen,
-      score: screen === SCREEN_TITLE ? best : score,
-      mission,
-      message,
-      time,
-      particles,
-    };
-    renderer.draw(view);
-    status.textContent = `Sky Courier — ${mission}. Score ${score}.`;
-    requestAnimationFrame(frame);
-  }
+function frame(now) {
   requestAnimationFrame(frame);
+  const dtMs = Math.min(100, now - last);
+  last = now;
+  S.time += dtMs / 1000;
+  S.msgAge += dtMs / 1000;
+  // Edge-triggered keys.
+  if (input.wasPressed('Space')) {
+    audio.unlock();
+    if (S.state === 'menu' || S.state === 'crash' || S.state === 'done') {
+      const muted = S.muted;
+      S = freshGame();
+      S.muted = muted;
+      S.state = 'fly';
+      announce('SORTIE 01 — DELIVER PARCEL 1', 'Home Field → Riverbend · gates 1–2', '#39d5e8');
+    } else if (S.state === 'pause') {
+      const muted = S.muted;
+      S = freshGame();
+      S.muted = muted;
+      S.state = 'fly';
+    }
+  }
+  if (input.wasPressed('KeyP') || input.wasPressed('Escape')) {
+    if (S.state === 'fly') S.state = 'pause';
+    else if (S.state === 'pause') S.state = 'fly';
+  }
+  if (input.wasPressed('KeyM')) {
+    S.muted = audio.toggleMute();
+  }
+  if (S.state === 'fly') {
+    acc += dtMs / 1000;
+    let n = 0;
+    while (acc >= STEP && n < 5) {
+      const events = stepPlane(S.plane, input.state(), STEP);
+      handleEvents(events);
+      checkGatePass();
+      acc -= STEP;
+      n++;
+    }
+    if (n === 5) acc = 0;
+    audio.update(S.plane.throttle, S.plane.speed, S.plane.speed < 26 && !S.plane.onGround);
+  }
+  render(now);
+  input.endFrame();
 }
 
-if (shot) runShot(shot);
-else runGame();
+// A small handle for automated play-tests: state, score and position.
+window.__skyCourier = {
+  get state() { return S.state; },
+  get score() { return S.score; },
+  get rings() { return S.rings; },
+  get delivered() { return S.delivered; },
+  get fuel() { return S.plane.fuel; },
+  get hull() { return S.plane.hull; },
+  get speed() { return S.plane.speed; },
+  get pos() { return [S.plane.x, S.plane.y, S.plane.z]; },
+  get leg() { return S.leg; },
+  get heading() { return S.plane.heading; },
+  get pitch() { return S.plane.pitch; },
+  get bank() { return S.plane.bank; },
+  get onGround() { return S.plane.onGround; },
+  get throttle() { return S.plane.throttle; },
+  get nextGate() {
+    const g = nextGate();
+    return g ? { n: g.n, x: g.x, y: g.y, z: g.z, dest: g.dest } : null;
+  },
+  get dest() {
+    const f = legDestField();
+    return { name: f.name, x: f.x, y: f.elev, z: f.z, heading: f.heading };
+  },
+};
+
+announce('', '');
+requestAnimationFrame(frame);

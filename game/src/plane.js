@@ -1,150 +1,213 @@
-// The little prop plane: its state and its flight model.
-// Throttle feeds speed, pitch steers the nose, lift holds it up only while
-// the wing has airspeed. Too slow and it stalls; too fast and turns bite
-// less. Fuel burns with throttle; damage comes from hard landings and from
-// scraping the ground.
+// plane.js — the little red prop plane: its mesh, its arcade-sim physics,
+// and the landing / damage rules. Forward is -z in model space... actually
+// the model faces +x: nose at +x, wings span z, up is +y. The pose matrix
+// (matFromPose) turns heading/pitch/roll into the world transform, and the
+// same angles drive the chase camera and the ADI.
 
-import { PLANE, STEP, STRIPS } from './config.js';
-import { groundHeightAt, stripAt } from './world.js';
+import { builder } from './mesh.js';
+import { clamp } from './seed.js';
+import { FIELDS, heightAt } from './world.js';
 
-export function createPlane() {
+export const STALL_SPEED = 26; // m/s: below this the wing stops flying
+export const MAX_SPEED = 82; // m/s at full throttle, level
+export const TAKEOFF_SPEED = 30;
+
+const RED = [0.78, 0.16, 0.12];
+const RED_DARK = [0.55, 0.1, 0.08];
+const CREAM = [0.93, 0.88, 0.74];
+const GREY = [0.32, 0.33, 0.36];
+const GLASS = [0.55, 0.75, 0.85];
+
+export function buildPlaneMesh() {
+  const b = builder();
+  // Fuselage: a long tapered box, cream belly, red back.
+  b.box(0, 0, 0, 3.4, 0.85, 0.85, RED, {
+    top: RED, bottom: CREAM, front: RED_DARK, back: RED_DARK,
+  });
+  b.box(3.2, 0.1, 0, 0.7, 0.6, 0.6, RED_DARK); // nose cap
+  // Canopy: a glass slab on top, just behind the nose.
+  b.slab(0.9, 2.1, 0.75, 1.25, -0.55, 0.55, GLASS);
+  // Main wing: wide slab through the middle, cream tips.
+  b.slab(-0.6, 0.6, -0.12, 0.12, -5.6, 5.6, RED);
+  b.slab(-0.6, 0.6, -0.12, 0.12, -5.6, -4.7, CREAM);
+  b.slab(-0.6, 0.6, -0.12, 0.12, 4.7, 5.6, CREAM);
+  // Tail: horizontal stabiliser and a tall red fin.
+  b.slab(-3.4, -2.6, -0.05, 0.15, -2.1, 2.1, RED);
+  b.slab(-3.5, -2.7, 0.6, 1.9, -0.14, 0.14, RED);
+  // Propeller: a thin dark disc at the nose, spun in the render loop by
+  // scaling it — the mesh itself is a flat cross that reads as a blur.
+  b.slab(3.95, 4.05, -1.5, 1.5, -0.09, 0.09, GREY);
+  b.slab(3.95, 4.05, -0.09, 0.09, -1.5, 1.5, GREY);
+  b.box(4.0, 0, 0, 0.3, 0.3, 0.3, GREY); // spinner hub
+  // Fixed gear: two little legs with wheels, so the plane sits on strips.
+  for (const s of [-1, 1]) {
+    b.box(0.9, -1.15, s * 1.1, 0.12, 0.35, 0.12, GREY);
+    b.box(0.9, -1.5, s * 1.1, 0.32, 0.32, 0.22, [0.1, 0.1, 0.1]);
+  }
+  b.box(-2.6, -1.05, 0, 0.1, 0.3, 0.1, GREY);
+  return b.data;
+}
+
+// The afterburner flame: a small orange cone behind the tail, drawn only
+// when the throttle is past 85% and the plane is flying.
+export function buildFlameMesh() {
+  const b = builder();
+  const orange = [1, 0.55, 0.12];
+  const yellow = [1, 0.85, 0.3];
+  b.pyramid(-6.4, 0, 0, -3.6, 0.55, orange, yellow);
+  return b.data;
+}
+
+export function freshPlane() {
+  const home = FIELDS[0];
+  const rad = ((90 - home.heading) * Math.PI) / 180;
   return {
-    x: STRIPS[0].x,
-    y: 0, // set by placeOnRunway
-    vx: 0,
-    vy: 0,
-    angle: 0, // nose direction, radians; 0 = level to the right
-    throttle: 0,
-    fuel: PLANE.fuelMax,
-    damage: 0,
-    airborne: false,
-    stalled: false,
-    propAngle: 0,
-    landedStrip: STRIPS[0],
+    x: home.x, y: home.elev + 1.6, z: home.z,
+    heading: rad, pitch: 0, bank: 0,
+    speed: 0, throttle: 0,
+    fuel: 100, hull: 100,
+    onGround: true, landed: false, crashed: false,
+    vspeed: 0, gLoad: 1, aoa: 0,
+    propSpin: 0,
   };
 }
 
-/** Put the plane on its home runway, ready for takeoff. */
-export function placeOnRunway(plane, world) {
-  plane.x = STRIPS[0].x;
-  plane.y = groundHeightAt(world, plane.x) - 14;
-  plane.vx = 0;
-  plane.vy = 0;
-  plane.angle = 0;
-  plane.throttle = 0;
-  plane.fuel = PLANE.fuelMax;
-  plane.damage = 0;
-  plane.airborne = false;
-  plane.stalled = false;
-  plane.landedStrip = STRIPS[0];
-}
+// ---- flight ---------------------------------------------------------------
 
-export function speedOf(plane) {
-  return Math.hypot(plane.vx, plane.vy);
-}
-
-/**
- * One fixed step of flight. `stick` is -1..1 (pull up / push down),
- * `throttleUp` / `throttleDown` are held keys. Returns an event string or
- * null: 'takeoff', 'landed-soft', 'landed-hard', 'crashed', 'out-of-fuel'.
- */
-export function stepPlane(plane, world, stick, throttleUp, throttleDown, dt) {
-  plane.propAngle += (0.35 + plane.throttle * 1.4) * dt * 12;
-  if (throttleUp) plane.throttle = Math.min(1, plane.throttle + PLANE.throttleRate * dt);
-  if (throttleDown) plane.throttle = Math.max(0, plane.throttle - PLANE.throttleRate * dt);
-
-  const speed = speedOf(plane);
-  const turning = speed > PLANE.maxSpeed ? 0.45 : 1;
-  plane.angle += stick * PLANE.pitchRate * turning * dt;
-  plane.angle = Math.max(-1.1, Math.min(1.1, plane.angle));
-
-  // Engine thrust along the nose, drag against the motion.
-  const thrust = plane.throttle * 300 * (plane.fuel > 0 ? 1 : 0);
-  plane.vx += Math.cos(plane.angle) * thrust * dt;
-  plane.vy += Math.sin(plane.angle) * thrust * dt;
-  const drag = PLANE.drag * speed * speed;
-  if (speed > 0.01) {
-    plane.vx -= (plane.vx / speed) * drag * dt;
-    plane.vy -= (plane.vy / speed) * drag * dt;
-  }
-  // The wing aligns the velocity with the nose: pitch steers the flight
-  // path, so level flight at cruise holds altitude and a nose-down pitch
-  // descends. Lift only partly cancels gravity, and the share it cancels
-  // grows with airspeed — below stall speed the wing gives up, the nose
-  // drops on its own and gravity takes over.
-  plane.stalled = plane.airborne && speed < PLANE.stallSpeed;
-  if (plane.airborne) {
-    const along = plane.vx * Math.cos(plane.angle) + plane.vy * Math.sin(plane.angle);
-    const px = plane.vx - along * Math.cos(plane.angle);
-    const py = plane.vy - along * Math.sin(plane.angle);
-    const align = Math.min(1, 2.4 * dt);
-    plane.vx -= px * align;
-    plane.vy -= py * align;
-    const liftShare = Math.min(1, speed / 200);
-    plane.vy += PLANE.gravity * (1 - liftShare) * dt;
-    if (plane.stalled) {
-      plane.angle = Math.min(0.9, plane.angle + 0.55 * dt);
-      plane.vy += PLANE.gravity * 0.5 * dt;
+// Where the plane is relative to a runway: null when not over one.
+export function runwayAt(x, z) {
+  for (const f of FIELDS) {
+    const rad = ((90 - f.heading) * Math.PI) / 180;
+    const dx = Math.cos(rad), dz = -Math.sin(rad);
+    const px = -dz, pz = dx;
+    const along = dx * (x - f.x) + dz * (z - f.z);
+    const across = px * (x - f.x) + pz * (z - f.z);
+    // The strip plus a 60 m clearway past each threshold: the flat field
+    // around it is still the airfield, and a touchdown just short of the
+    // numbers is a landing, not a crash.
+    if (Math.abs(along) < f.len / 2 + 60 && Math.abs(across) < f.wid / 2 + 6) {
+      return { field: f, along, across };
     }
   }
-  // Gentle speed ceiling so the prop cannot run away downhill.
-  const capped = Math.min(speedOf(plane), PLANE.maxSpeed + 60);
-  const now = speedOf(plane);
-  if (now > 0.01) {
-    plane.vx = (plane.vx / now) * capped;
-    plane.vy = (plane.vy / now) * capped;
-  }
-
-  plane.x += plane.vx * dt;
-  plane.y += plane.vy * dt;
-  plane.fuel = Math.max(0, plane.fuel - plane.throttle * PLANE.fuelBurn * dt);
-
-  const ground = groundHeightAt(world, plane.x);
-  const strip = stripAt(plane.x);
-  // Takeoff: rolling fast enough with the nose up leaves the ground.
-  if (!plane.airborne && speedOf(plane) > 130 && plane.angle < -0.12) {
-    plane.airborne = true;
-    return 'takeoff';
-  }
-  if (plane.airborne && plane.y + 14 >= ground) {
-    const sink = plane.vy;
-    plane.y = ground - 14;
-    plane.vy = 0;
-    plane.vx *= 0.55;
-    plane.airborne = false;
-    plane.angle = 0;
-    if (!strip) {
-      plane.damage = 100;
-      return 'crashed';
-    }
-    plane.landedStrip = strip;
-    if (sink > 150) {
-      plane.damage += PLANE.hardLandingDamage;
-      if (plane.damage >= 100) return 'crashed';
-      return 'landed-hard';
-    }
-    return sink > 60 ? 'landed-hard' : 'landed-soft';
-  }
-  if (!plane.airborne && plane.y + 14 >= ground) {
-    // Rolling on the ground: wheels stay on it. Off the runway the grass
-    // drags hard, and arriving there fast wrecks the undercarriage.
-    plane.y = ground - 14;
-    plane.vy = 0;
-    if (!strip) {
-      plane.vx *= Math.max(0, 1 - 2.2 * dt);
-      if (speedOf(plane) > 100) {
-        plane.damage = 100;
-        return 'crashed';
-      }
-    }
-  }
-  if (plane.fuel <= 0 && plane.airborne) return 'out-of-fuel';
-  if (plane.x < 60) { plane.x = 60; plane.vx = Math.max(0, plane.vx); }
   return null;
 }
 
-/** Damage while the belly scrapes along the ground at speed. */
-export function scrapeDamage(plane, dt) {
-  plane.damage = Math.min(100, plane.damage + PLANE.scrapeDamage * dt);
-  return plane.damage >= 100;
+export function compassDeg(heading) {
+  return (((90 - (heading * 180) / Math.PI) % 360) + 360) % 360;
+}
+
+// One fixed physics step. Returns a list of events for the game to score
+// and announce: gate passes and landings are detected by main.js, but the
+// ground, the stall and the damage live here.
+export function stepPlane(p, input, dt) {
+  const events = [];
+  // Throttle: A/D (or arrows) spool it up and down.
+  if (input.throttleUp) p.throttle = clamp(p.throttle + dt * 0.65, 0, 1);
+  if (input.throttleDown) p.throttle = clamp(p.throttle - dt * 0.65, 0, 1);
+  // Bank: Q/E roll the plane; it levels itself when left alone.
+  if (input.bankLeft) p.bank = clamp(p.bank - dt * 1.5, -1.05, 1.05);
+  else if (input.bankRight) p.bank = clamp(p.bank + dt * 1.5, -1.05, 1.05);
+  else p.bank += (0 - p.bank) * Math.min(1, dt * 0.55);
+  // A banked wing turns the nose: coordinated turn, rate from the bank,
+  // sharpened a little past real life so the rings stay hittable.
+  const flying = !p.onGround;
+  if (flying && p.speed > 8) {
+    p.heading -= (9.81 * Math.tan(p.bank) / Math.max(p.speed, 12)) * dt * 1.6;
+  }
+  // Pitch: W/S. The elevator bites in the air, and — once the roll has
+  // speed — on the ground too, so the pilot can rotate for takeoff.
+  const authority = flying
+    ? clamp((p.speed - 12) / 22, 0.15, 1)
+    : clamp((p.speed - 15) / 20, 0, 0.6);
+  if (input.pitchUp) p.pitch = clamp(p.pitch + dt * 0.55 * authority, -0.6, 0.6);
+  if (input.pitchDown) p.pitch = clamp(p.pitch - dt * 0.55 * authority, -0.6, 0.6);
+  if (flying && p.speed < STALL_SPEED) {
+    // Stall: the nose drops on its own and the plane sinks.
+    p.pitch = Math.max(p.pitch - dt * 0.35, -0.45);
+    events.push({ type: 'stall' });
+  }
+  // Speed chases the throttle, climbing bleeds it, diving feeds it.
+  const target = p.throttle * MAX_SPEED;
+  p.speed += (target - p.speed) * Math.min(1, dt * 0.35);
+  p.speed -= 9.81 * Math.sin(p.pitch) * dt * 0.42;
+  if (p.onGround) p.speed = Math.max(0, p.speed - dt * 1.2);
+  p.speed = clamp(p.speed, 0, 95);
+  // Move along the nose.
+  const cp = Math.cos(p.pitch), sp = Math.sin(p.pitch);
+  const fx = Math.cos(p.heading) * cp;
+  const fy = sp;
+  const fz = -Math.sin(p.heading) * cp;
+  const prevY = p.y;
+  p.x += fx * p.speed * dt;
+  p.y += fy * p.speed * dt;
+  p.z += fz * p.speed * dt;
+  if (flying && p.speed < STALL_SPEED) p.y -= (STALL_SPEED - p.speed) * 0.55 * dt;
+  p.vspeed = (p.y - prevY) / dt;
+  p.gLoad = 1 + Math.abs(Math.tan(p.bank)) * 0.55 + Math.abs(p.pitch) * 0.3;
+  p.aoa = (p.pitch * 180) / Math.PI;
+  p.propSpin += dt * (4 + p.throttle * 46);
+  // Fuel burns with the throttle; empty tanks mean a glider, and the
+  // throttle stays shut until a delivery refuels the plane.
+  if (p.fuel > 0) {
+    p.fuel = Math.max(0, p.fuel - dt * (0.18 + p.throttle * 0.45) * (p.onGround ? 0.35 : 1));
+    if (p.fuel <= 0) {
+      p.throttle = 0;
+      events.push({ type: 'fuelEmpty' });
+    }
+  } else {
+    p.throttle = 0;
+  }
+  // The ground.
+  const groundY = heightAt(p.x, p.z) + 1.6;
+  if (p.y <= groundY) {
+    p.y = groundY;
+    const hitV = p.vspeed;
+    const strip = runwayAt(p.x, p.z);
+    if (p.onGround) {
+      // Rolling: rough ground at speed rattles the airframe.
+      if (!strip && p.speed > 34) {
+        p.hull = Math.max(0, p.hull - dt * 6);
+        events.push({ type: 'rough' });
+      }
+    } else if (strip && hitV > -7 && p.speed < 62) {
+      // Down on the strip: a gentle, level touchdown is soft; arriving
+      // banked still lands, but the gear takes a bite out of the hull.
+      const banked = Math.abs(p.bank) >= 0.35;
+      if (banked) p.hull = Math.max(0, p.hull - 20);
+      p.onGround = true;
+      p.pitch = 0;
+      p.bank = 0;
+      p.landed = true;
+      events.push({
+        type: 'landed',
+        field: strip.field,
+        soft: hitV > -3.5 && !banked,
+        banked,
+        vspeed: hitV,
+      });
+    } else if (hitV > -6 && p.speed < 45) {
+      // A survivable belly landing in a field: it costs hull, not the plane.
+      p.onGround = true;
+      p.pitch = 0;
+      p.bank = 0;
+      p.hull = Math.max(0, p.hull - 16);
+      p.speed *= 0.55;
+      events.push({ type: 'roughLanding' });
+    } else {
+      p.hull = 0;
+      p.crashed = true;
+      events.push({ type: 'crash', vspeed: hitV });
+    }
+  }
+  // Rotation: enough speed and a pulled nose lifts off the strip.
+  if (p.onGround && p.speed > TAKEOFF_SPEED && p.pitch > 0.08 && p.fuel > 0) {
+    p.onGround = false;
+    p.landed = false;
+    events.push({ type: 'takeoff' });
+  }
+  if (p.hull <= 0 && !p.crashed) {
+    p.crashed = true;
+    events.push({ type: 'crash', vspeed: p.vspeed });
+  }
+  return events;
 }

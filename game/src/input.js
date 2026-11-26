@@ -1,77 +1,69 @@
-// Keyboard and pointer input. Held keys steer and work the throttle;
-// one-shot presses (start, restart, pause, mute) are queued as bit flags
-// and taken once by the loop, so a press between frames is never lost.
+// input.js — keyboard state, read once per frame by the game loop.
+// Keys are tracked by e.code so layouts do not matter. The game also
+// listens for Space (start / restart), P / Escape (pause) and M (mute) as
+// edge-triggered actions, which main.js consumes and clears each frame.
 
-export const ACTION_CONFIRM = 1;
-export const ACTION_PAUSE = 2;
-export const ACTION_MUTE = 4;
-
-const PITCH_UP = new Set(['ArrowUp', 'KeyW']);
-const PITCH_DOWN = new Set(['ArrowDown', 'KeyS']);
-const THROTTLE_UP = new Set(['ArrowRight', 'KeyD']);
-const THROTTLE_DOWN = new Set(['ArrowLeft', 'KeyA']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
-const MUTE = new Set(['KeyM']);
-
-export function createInput(canvas) {
-  const state = {
-    pitchUp: false,
-    pitchDown: false,
-    throttleUp: false,
-    throttleDown: false,
-    actions: 0,
-    mouseX: 0,
-    mouseY: 0,
-    clicked: false,
+export function makeInput() {
+  const held = new Set();
+  const pressed = new Set();
+  const codes = {
+    KeyW: 'pitchUp', ArrowUp: 'pitchUp',
+    KeyS: 'pitchDown', ArrowDown: 'pitchDown',
+    KeyA: 'throttleDown', ArrowLeft: 'throttleDown',
+    KeyD: 'throttleUp', ArrowRight: 'throttleUp',
+    KeyQ: 'bankLeft', KeyE: 'bankRight',
   };
-
-  window.addEventListener('keydown', (event) => {
-    if (PITCH_UP.has(event.code)) state.pitchUp = true;
-    else if (PITCH_DOWN.has(event.code)) state.pitchDown = true;
-    else if (THROTTLE_UP.has(event.code)) state.throttleUp = true;
-    else if (THROTTLE_DOWN.has(event.code)) state.throttleDown = true;
-    else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) state.actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) state.actions |= ACTION_PAUSE;
-    } else if (MUTE.has(event.code)) {
-      if (!event.repeat) state.actions |= ACTION_MUTE;
-    } else return;
-    event.preventDefault();
+  function onDown(e) {
+    if (e.repeat) return;
+    held.add(e.code);
+    pressed.add(e.code);
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
+      e.preventDefault();
+    }
+  }
+  function onUp(e) {
+    held.delete(e.code);
+  }
+  window.addEventListener('keydown', onDown);
+  window.addEventListener('keyup', onUp);
+  // Mouse steering: hold the left button and drag sideways to bank.
+  let mouseBank = 0;
+  let dragging = false;
+  let lastX = 0;
+  window.addEventListener('mousedown', (e) => {
+    dragging = true;
+    lastX = e.clientX;
   });
-  window.addEventListener('keyup', (event) => {
-    if (PITCH_UP.has(event.code)) state.pitchUp = false;
-    else if (PITCH_DOWN.has(event.code)) state.pitchDown = false;
-    else if (THROTTLE_UP.has(event.code)) state.throttleUp = false;
-    else if (THROTTLE_DOWN.has(event.code)) state.throttleDown = false;
+  window.addEventListener('mouseup', () => {
+    dragging = false;
+    mouseBank = 0;
   });
-  window.addEventListener('blur', () => {
-    state.pitchUp = false;
-    state.pitchDown = false;
-    state.throttleUp = false;
-    state.throttleDown = false;
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    mouseBank = Math.max(-1, Math.min(1, mouseBank + (e.clientX - lastX) * 0.004));
+    lastX = e.clientX;
   });
-  canvas.addEventListener('pointerdown', (event) => {
-    const rect = canvas.getBoundingClientRect();
-    state.mouseX = (event.clientX - rect.left) * (canvas.width / rect.width);
-    state.mouseY = (event.clientY - rect.top) * (canvas.height / rect.height);
-    state.clicked = true;
-    state.actions |= ACTION_CONFIRM;
-  });
-  return state;
-}
-
-/** Take and clear the queued one-shot actions. */
-export function takeActions(state) {
-  const taken = state.actions;
-  state.actions = 0;
-  return taken;
-}
-
-/** Take and clear the last mouse click, if any. */
-export function takeClick(state) {
-  if (!state.clicked) return null;
-  state.clicked = false;
-  return { x: state.mouseX, y: state.mouseY };
+  return {
+    state() {
+      const s = {
+        pitchUp: false, pitchDown: false,
+        throttleUp: false, throttleDown: false,
+        bankLeft: false, bankRight: false,
+      };
+      for (const code of held) {
+        const name = codes[code];
+        if (name) s[name] = true;
+      }
+      if (mouseBank < -0.12) s.bankLeft = true;
+      if (mouseBank > 0.12) s.bankRight = true;
+      return s;
+    },
+    // True once for each physical press since the last call.
+    wasPressed(code) {
+      return pressed.has(code);
+    },
+    endFrame() {
+      pressed.clear();
+    },
+  };
 }
