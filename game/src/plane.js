@@ -20,31 +20,166 @@ const GLASS = [0.55, 0.75, 0.85];
 
 export function buildPlaneMesh() {
   const b = builder();
-  // Fuselage: a long tapered box, cream belly, red back.
-  b.box(0, 0, 0, 3.4, 0.85, 0.85, RED, {
-    top: RED, bottom: CREAM, front: RED_DARK, back: RED_DARK,
-  });
-  b.box(3.2, 0.1, 0, 0.7, 0.6, 0.6, RED_DARK); // nose cap
-  // Canopy: a glass slab on top, just behind the nose.
-  b.slab(0.9, 2.1, 0.75, 1.25, -0.55, 0.55, GLASS);
-  // Main wing: wide slab through the middle, cream tips.
-  b.slab(-0.6, 0.6, -0.12, 0.12, -5.6, 5.6, RED);
-  b.slab(-0.6, 0.6, -0.12, 0.12, -5.6, -4.7, CREAM);
-  b.slab(-0.6, 0.6, -0.12, 0.12, 4.7, 5.6, CREAM);
-  // Tail: horizontal stabiliser and a tall red fin.
-  b.slab(-3.4, -2.6, -0.05, 0.15, -2.1, 2.1, RED);
-  b.slab(-3.5, -2.7, 0.6, 1.9, -0.14, 0.14, RED);
-  // Propeller: a thin dark disc at the nose, spun in the render loop by
-  // scaling it — the mesh itself is a flat cross that reads as a blur.
-  b.slab(3.95, 4.05, -1.5, 1.5, -0.09, 0.09, GREY);
-  b.slab(3.95, 4.05, -0.09, 0.09, -1.5, 1.5, GREY);
-  b.box(4.0, 0, 0, 0.3, 0.3, 0.3, GREY); // spinner hub
-  // Fixed gear: two little legs with wheels, so the plane sits on strips.
-  for (const s of [-1, 1]) {
-    b.box(0.9, -1.15, s * 1.1, 0.12, 0.35, 0.12, GREY);
-    b.box(0.9, -1.5, s * 1.1, 0.32, 0.32, 0.22, [0.1, 0.1, 0.1]);
+  // Fuselage: a lofted shell, not a box — a row of cross-sections (x,
+  // belly, roof, half-width) joined face by face, so the body swells
+  // over the cowling, holds the cabin, then tapers to a fine tail cone.
+  // Cream belly, red back and flanks, dark nose face (cooling intake).
+  const fus = [
+    [3.6, -0.40, 0.40, 0.40],
+    [3.0, -0.47, 0.47, 0.47],
+    [2.2, -0.49, 0.49, 0.48],
+    [1.4, -0.48, 0.52, 0.46],
+    [0.4, -0.46, 0.55, 0.43],
+    [-0.6, -0.43, 0.52, 0.39],
+    [-1.7, -0.36, 0.40, 0.30],
+    [-2.8, -0.24, 0.26, 0.18],
+    [-3.9, -0.11, 0.13, 0.08],
+  ];
+  for (let i = 0; i < fus.length - 1; i++) {
+    const a = fus[i], c = fus[i + 1];
+    b.quad([a[0], a[2], a[3]], [c[0], c[2], c[3]], [c[0], c[2], -c[3]], [a[0], a[2], -a[3]], RED);
+    b.quad([a[0], a[1], -a[3]], [c[0], c[1], -c[3]], [c[0], c[1], c[3]], [a[0], a[1], a[3]], CREAM);
+    b.quad([a[0], a[1], a[3]], [c[0], c[1], c[3]], [c[0], c[2], c[3]], [a[0], a[2], a[3]], RED);
+    b.quad([c[0], c[1], -c[3]], [a[0], a[1], -a[3]], [a[0], a[2], -a[3]], [c[0], c[2], -c[3]], RED);
   }
-  b.box(-2.6, -1.05, 0, 0.1, 0.3, 0.1, GREY);
+  b.quad([3.6, -0.40, 0.40], [3.6, -0.40, -0.40], [3.6, 0.40, -0.40], [3.6, 0.40, 0.40], RED_DARK);
+  b.quad([-3.9, -0.11, -0.08], [-3.9, -0.11, 0.08], [-3.9, 0.13, 0.08], [-3.9, 0.13, -0.08], RED);
+  // Cowling cooling inlets on the nose face, and a cream cheatline
+  // stripe along the cabin flank — the livery line a real light plane wears.
+  b.box(3.62, -0.12, 0.18, 0.03, 0.14, 0.12, [0.08, 0.08, 0.09]);
+  b.box(3.62, -0.12, -0.18, 0.03, 0.14, 0.12, [0.08, 0.08, 0.09]);
+  b.slab(0.4, 2.2, 0.05, 0.16, 0.44, 0.475, CREAM);
+  b.slab(0.4, 2.2, 0.05, 0.16, -0.475, -0.44, CREAM);
+  // Canopy: a faceted bubble, not a slab — five stations from the sloped
+  // windshield to the tapered rear, each a shallow arch (base, mid, ridge)
+  // so the glass reads as a curved greenhouse over the cabin.
+  const can = [
+    [1.35, 0.48, 0.62, 0.68, 0.30, 0.16],
+    [0.9, 0.50, 0.82, 0.92, 0.38, 0.20],
+    [0.2, 0.52, 0.86, 0.96, 0.40, 0.21],
+    [-0.5, 0.50, 0.80, 0.88, 0.36, 0.18],
+    [-1.0, 0.44, 0.60, 0.64, 0.28, 0.12],
+  ];
+  for (let i = 0; i < can.length - 1; i++) {
+    const a = can[i], c = can[i + 1];
+    for (const s of [1, -1]) {
+      const q = (y0, z0, y1, z1, y2, z2, y3, z3) => s > 0
+        ? b.quad([a[0], y0, z0], [c[0], y1, z1], [c[0], y2, z2], [a[0], y3, z3], GLASS)
+        : b.quad([c[0], y1, z1], [a[0], y0, z0], [a[0], y3, z3], [c[0], y2, z2], GLASS);
+      q(a[1], s * a[4], c[1], s * c[4], c[2], s * c[5], a[2], s * a[5]);
+      q(a[2], s * a[5], c[2], s * c[5], c[3], 0, a[3], 0);
+    }
+  }
+  // Windshield (front) and rear glass faces.
+  b.quad([1.35, 0.48, 0.30], [1.35, 0.48, -0.30], [1.35, 0.62, -0.16], [1.35, 0.62, 0.16], GLASS);
+  b.tri([1.35, 0.62, 0.16], [1.35, 0.62, -0.16], [1.35, 0.68, 0], GLASS);
+  b.quad([-1.0, 0.44, -0.28], [-1.0, 0.44, 0.28], [-1.0, 0.60, 0.12], [-1.0, 0.60, -0.12], GLASS);
+  b.tri([-1.0, 0.60, -0.12], [-1.0, 0.60, 0.12], [-1.0, 0.64, 0], GLASS);
+  // Radio mast on the cabin roof.
+  b.box(-0.8, 0.72, 0, 0.03, 0.22, 0.03, GREY);
+  // Wings: a tapered-wing helper — root chord wide, tip chord narrow,
+  // tip raised for dihedral, thin at the tip — called for the main wing
+  // (low-wing, under the cabin) and the tailplane alike.
+  function taperedWing(s, rz, tz, rLE, rTE, rYt, rYb, tLE, tTE, tYt, tYb, color) {
+    const rL = [rLE, rYt, s * rz], rT = [rTE, rYt, s * rz];
+    const tL = [tLE, tYt, s * tz], tT = [tTE, tYt, s * tz];
+    const rbL = [rLE, rYb, s * rz], rbT = [rTE, rYb, s * rz];
+    const tbL = [tLE, tYb, s * tz], tbT = [tTE, tYb, s * tz];
+    if (s > 0) b.quad(rL, rT, tT, tL, color); else b.quad(rL, tL, tT, rT, color);
+    if (s > 0) b.quad(rbL, tbL, tbT, rbT, color); else b.quad(rbL, rbT, tbT, tbL, color);
+    if (s > 0) b.quad(rbL, rL, tL, tbL, color); else b.quad(rbL, tbL, tL, rL, color);
+    if (s > 0) b.quad(rbT, tbT, tT, rT, color); else b.quad(rbT, rT, tT, tbT, color);
+    if (s > 0) b.quad(tL, tT, tbT, tbL, color); else b.quad(tL, tbL, tbT, tT, color);
+  }
+  // Main wing, low set with dihedral: red to z=±4.3, cream tips outboard
+  // (span 9.8 against a 7.5 fuselage, as on a real light plane).
+  for (const s of [1, -1]) {
+    taperedWing(s, 0.35, 4.3, 0.75, -0.85, -0.20, -0.34, 0.45, -0.62, 0.14, 0.06, RED);
+    taperedWing(s, 4.3, 4.9, 0.45, -0.62, 0.14, 0.06, 0.38, -0.58, 0.17, 0.09, CREAM);
+    // Navigation lights: red port (+z), green starboard (−z).
+    b.box(0.0, 0.13, s * 4.92, 0.12, 0.05, 0.05, s > 0 ? [0.9, 0.1, 0.1] : [0.1, 0.85, 0.25]);
+  }
+  // Pitot tube under the port wing, landing light in the port leading edge.
+  b.box(0.2, -0.38, -1.6, 0.22, 0.03, 0.03, GREY);
+  b.box(0.6, -0.15, -3.2, 0.04, 0.08, 0.12, [1, 0.95, 0.8]);
+  // Tail: tapered horizontal stabiliser (same helper as the wing) and a
+  // swept vertical fin — leading edge raked back, cream tip band, white
+  // tail light at the very tip of the cone.
+  for (const s of [1, -1]) {
+    taperedWing(s, 0.15, 1.35, -2.70, -3.60, 0.22, 0.12, -3.00, -3.70, 0.28, 0.20, RED);
+  }
+  const fin = { bf: [-2.55, 0.18], bb: [-3.85, 0.18], tf: [-3.15, 1.15], tb: [-3.80, 1.15] };
+  for (const s of [1, -1]) {
+    const z = s * 0.07;
+    if (s > 0) {
+      b.quad([fin.bf[0], fin.bf[1], z], [fin.tf[0], fin.tf[1], z], [fin.tb[0], fin.tb[1], z], [fin.bb[0], fin.bb[1], z], RED);
+    } else {
+      b.quad([fin.bb[0], fin.bb[1], z], [fin.tb[0], fin.tb[1], z], [fin.tf[0], fin.tf[1], z], [fin.bf[0], fin.bf[1], z], RED);
+    }
+  }
+  b.quad([-2.55, 0.18, 0.07], [-2.55, 0.18, -0.07], [-3.15, 1.15, -0.07], [-3.15, 1.15, 0.07], RED);
+  b.quad([-3.80, 1.15, 0.07], [-3.80, 1.15, -0.07], [-3.85, 0.18, -0.07], [-3.85, 0.18, 0.07], RED);
+  b.quad([-3.15, 1.15, 0.07], [-3.15, 1.15, -0.07], [-3.80, 1.15, -0.07], [-3.80, 1.15, 0.07], RED);
+  // Cream tip band on the fin, proud of the surface so it never z-fights.
+  for (const s of [1, -1]) {
+    const z = s * 0.075;
+    const y0 = 0.95, y1 = 1.15;
+    const xf0 = -2.55 - (y0 - 0.18) * (0.60 / 0.97), xf1 = -3.15;
+    const xb0 = -3.85 + (y0 - 0.18) * (0.05 / 0.97), xb1 = -3.80;
+    if (s > 0) b.quad([xf0, y0, z], [xf1, y1, z], [xb1, y1, z], [xb0, y0, z], CREAM);
+    else b.quad([xb0, y0, z], [xb1, y1, z], [xf1, y1, z], [xf0, y0, z], CREAM);
+  }
+  b.box(-3.92, 0.01, 0, 0.06, 0.08, 0.08, [1, 1, 0.95]); // tail light
+  // Propeller: two tapered blades with a slight twist and cream tips,
+  // plus a four-sided spinner cone — a real prop, not a blur cross.
+  // Spinner: tip at x=4.45, square base at x=3.85.
+  const spin = [[3.85, 0.24, 0.24], [3.85, 0.24, -0.24], [3.85, -0.24, -0.24], [3.85, -0.24, 0.24]];
+  for (let i = 0; i < 4; i++) {
+    b.tri([4.45, 0, 0], spin[(i + 1) % 4], spin[i], RED);
+  }
+  b.quad([3.85, 0.24, 0.24], [3.85, 0.24, -0.24], [3.85, -0.24, -0.24], [3.85, -0.24, 0.24], RED_DARK);
+  for (const s of [1, -1]) {
+    // One blade from y=0.20*s out to y=1.15*s, chord 0.22 at the root
+    // narrowing to 0.14 at the tip, cream from 0.95*s out — short
+    // enough that the down blade clears the ground on its gear.
+    const blade = (y0, y1, color) => {
+      const a = [3.95, y0, 0.11], c = [3.95, y1, 0.07];
+      const d = [3.95, y1, -0.07], e = [3.95, y0, -0.11];
+      const A = [4.01, y0, 0.11], C = [4.01, y1, 0.11];
+      const D = [4.01, y1, -0.03], E = [4.01, y0, -0.11];
+      if (s > 0) {
+        b.quad(A, E, D, C, color);
+        b.quad(a, c, d, e, color);
+        b.quad(a, A, C, c, color);
+        b.quad(e, d, D, E, color);
+      } else {
+        b.quad(A, C, D, E, color);
+        b.quad(a, e, d, c, color);
+        b.quad(a, c, C, A, color);
+        b.quad(e, E, D, d, color);
+      }
+    };
+    blade(0.20 * s, 0.95 * s, GREY);
+    blade(0.95 * s, 1.15 * s, CREAM);
+    // Tip cap of the blade.
+    if (s > 0) b.quad([4.01, 1.15, -0.03], [3.95, 1.15, -0.03], [3.95, 1.15, 0.11], [4.01, 1.15, 0.11], CREAM);
+    else b.quad([4.01, -1.15, 0.11], [3.95, -1.15, 0.11], [3.95, -1.15, -0.03], [4.01, -1.15, -0.03], CREAM);
+  }
+  b.box(3.9, 0, 0, 0.18, 0.18, 0.18, RED_DARK); // hub behind the spinner
+  // Tricycle gear: a nose leg and two splayed main legs, each wheel in
+  // a red spat fairing with the tyre showing below, plus the exhaust
+  // stack under the cowling.
+  b.box(2.3, -0.85, 0, 0.09, 0.45, 0.09, GREY);
+  b.box(2.3, -1.32, 0, 0.26, 0.26, 0.16, [0.1, 0.1, 0.1]);
+  b.box(2.3, -1.32, 0, 0.28, 0.13, 0.18, GREY);
+  b.box(2.3, -1.18, 0, 0.32, 0.16, 0.13, RED);
+  for (const s of [-1, 1]) {
+    b.box(0.7, -0.85, s * 0.95, 0.09, 0.42, 0.09, GREY);
+    b.box(0.7, -1.35, s * 1.12, 0.26, 0.26, 0.16, [0.1, 0.1, 0.1]);
+    b.box(0.7, -1.35, s * 1.12, 0.28, 0.13, 0.18, GREY);
+    b.box(0.7, -1.18, s * 1.12, 0.34, 0.18, 0.14, RED);
+  }
+  b.box(2.9, -0.42, 0.35, 0.18, 0.07, 0.07, [0.12, 0.12, 0.13]);
   return b.data;
 }
 
